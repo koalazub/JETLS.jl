@@ -264,12 +264,9 @@ end # @static if VERSION ≥ v"1.12.2"
 # Analysis injections
 # ===================
 
-function CC.abstract_call_gf_by_type(
-        analyzer::LSAnalyzer, @nospecialize(func), arginfo::CC.ArgInfo, si::CC.StmtInfo,
-        @nospecialize(atype), sv::CC.InferenceState, max_methods::Int
+function ls_after_abstract_call_gf_by_type!(
+        analyzer::LSAnalyzer, sv::CC.InferenceState, ret, arginfo::CC.ArgInfo, @nospecialize(atype)
     )
-    ret = @invoke CC.abstract_call_gf_by_type(analyzer::ToplevelAbstractAnalyzer,
-        func::Any, arginfo::CC.ArgInfo, si::CC.StmtInfo, atype::Any, sv::CC.InferenceState, max_methods::Int)
     if !should_analyze(analyzer, sv)
         return ret
     end
@@ -285,6 +282,25 @@ function CC.abstract_call_gf_by_type(
         push!(sv.tasks, after_abstract_call_gf_by_type)
     end
     return ret
+end
+@static if hasfield(CC.InferenceState, :world)
+function CC.abstract_call_gf_by_type(
+        analyzer::LSAnalyzer, @nospecialize(func), arginfo::CC.ArgInfo, si::CC.StmtInfo,
+        @nospecialize(atype), sv::CC.InferenceState, max_methods::Int
+    )
+    ret = @invoke CC.abstract_call_gf_by_type(analyzer::ToplevelAbstractAnalyzer,
+        func::Any, arginfo::CC.ArgInfo, si::CC.StmtInfo, atype::Any, sv::CC.InferenceState, max_methods::Int)
+    return ls_after_abstract_call_gf_by_type!(analyzer, sv, ret, arginfo, atype)
+end
+else
+function CC.abstract_call_gf_by_type(
+        analyzer::LSAnalyzer, @nospecialize(func), arginfo::CC.ArgInfo, si::CC.StmtInfo,
+        @nospecialize(atype), vtypes::Union{CC.VarTable,Nothing}, sv::CC.InferenceState, max_methods::Int
+    )
+    ret = @invoke CC.abstract_call_gf_by_type(analyzer::ToplevelAbstractAnalyzer,
+        func::Any, arginfo::CC.ArgInfo, si::CC.StmtInfo, atype::Any, vtypes::Union{CC.VarTable,Nothing}, sv::CC.InferenceState, max_methods::Int)
+    return ls_after_abstract_call_gf_by_type!(analyzer, sv, ret, arginfo, atype)
+end
 end
 
 # TODO Better to factor out and share it with `JET.JETAnalyzer`
@@ -634,8 +650,10 @@ function report_method_error!(
         arginfo::CC.ArgInfo, @nospecialize(atype)
     )
     info = call.info
-    if isa(info, CC.ConstCallInfo)
-        info = info.call
+    @static if isdefined(CC, :ConstCallInfo)
+        if isa(info, CC.ConstCallInfo)
+            info = info.call
+        end
     end
     if isa(info, CC.MethodMatchInfo)
         report_method_error!(analyzer, sv, info, atype)

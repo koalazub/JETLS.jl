@@ -191,11 +191,17 @@ mutable struct OCBodyAnnotationState
 end
 OCBodyAnnotationState() = OCBodyAnnotationState(nothing)
 
+@static if isdefined(CC, :InferenceCache)
+    const ASTLocalInferenceCache = CC.InferenceCache
+else
+    const ASTLocalInferenceCache = Vector{CC.InferenceResult}
+end
+
 struct ASTTypeAnnotator <: CC.AbstractInterpreter
     world::UInt
     inf_params::CC.InferenceParams
     opt_params::CC.OptimizationParams
-    inf_cache::Vector{CC.InferenceResult}
+    inf_cache::ASTLocalInferenceCache
 
     toptree::SyntaxTreeC
     topmi::MethodInstance
@@ -230,7 +236,7 @@ struct ASTTypeAnnotator <: CC.AbstractInterpreter
                 aggressive_constant_propagation = true
             ),
             opt_params::CC.OptimizationParams = CC.OptimizationParams(),
-            inf_cache::Vector{CC.InferenceResult} = CC.InferenceResult[],
+            inf_cache::ASTLocalInferenceCache = ASTLocalInferenceCache(),
             oc_body_trees::IdDict{Method,SyntaxTreeC} = IdDict{Method,SyntaxTreeC}(),
             oc_body_annotation_states::IdDict{Method,OCBodyAnnotationState} = IdDict{Method,OCBodyAnnotationState}(),
             oc_argtype_observations::OCArgtypeTable = OCArgtypeTable(),
@@ -374,8 +380,13 @@ function CC.abstract_eval_new_opaque_closure(
     pushfirst!(oc_argtypes, po.env)
     interp.oc_body_annotation_states[po.source] = OCBodyAnnotationState()
     arginfo, stmtinfo = CC.ArgInfo(nothing, oc_argtypes), CC.StmtInfo(true, false)
-    callinfo = CC.abstract_call_opaque_closure(
-        interp, po, arginfo, stmtinfo, sv, #=check=#false)::CC.Future
+    callinfo = @static if hasfield(CC.InferenceState, :world)
+        CC.abstract_call_opaque_closure(
+            interp, po, arginfo, stmtinfo, sv, #=check=#false)::CC.Future
+    else
+        CC.abstract_call_opaque_closure(
+            interp, po, arginfo, stmtinfo, #=vtypes=#nothing, sv, #=check=#false)::CC.Future
+    end
     return CC.Future{CC.RTEffects}(callinfo, interp, sv) do callinfo, _, sv
         consume_oc_body_annotation_state!(interp, po.source)
         sv.stmt_info[sv.currpc] = CC.OpaqueClosureCreateInfo(callinfo)
@@ -497,20 +508,33 @@ end
 # signature-view inference from `abstract_eval_new_opaque_closure` passes `check=false`
 # and must not be recorded: it would join `most_general_argtypes` (the declared `Any`s)
 # into every observation and erase the refinement.
+@static if hasfield(CC.InferenceState, :world)
 function CC.abstract_call_opaque_closure(
         interp::ASTTypeAnnotator, closure::CC.PartialOpaque, arginfo::CC.ArgInfo,
-        si::CC.StmtInfo, sv::CC.AbsIntState, check::Bool
+        si::CC.StmtInfo, sv::CC.AbsIntState, check::Bool=true
     )
     check && record_oc_argtype_observation!(interp, closure, arginfo)
     return @invoke CC.abstract_call_opaque_closure(
         interp::CC.AbstractInterpreter, closure::CC.PartialOpaque, arginfo::CC.ArgInfo,
         si::CC.StmtInfo, sv::CC.AbsIntState, check::Bool)
 end
+else
+function CC.abstract_call_opaque_closure(
+        interp::ASTTypeAnnotator, closure::CC.PartialOpaque, arginfo::CC.ArgInfo,
+        si::CC.StmtInfo, vtypes::Union{CC.VarTable,Nothing}, sv::CC.AbsIntState, check::Bool=true
+    )
+    check && record_oc_argtype_observation!(interp, closure, arginfo)
+    return @invoke CC.abstract_call_opaque_closure(
+        interp::CC.AbstractInterpreter, closure::CC.PartialOpaque, arginfo::CC.ArgInfo,
+        si::CC.StmtInfo, vtypes::Union{CC.VarTable,Nothing}, sv::CC.AbsIntState, check::Bool)
+end
+end
 
 # `Generator(f, iter)` and `Filter(f, iter)` invoke `f` as iteration advances. In
 # nested iterator pipelines, that invocation is mediated by iterator machinery, so
 # the `PartialOpaque` call hook may not observe it. Treat construction as observing
 # `f` at the iterator element type.
+@static if hasfield(CC.InferenceState, :world)
 function CC.abstract_call_gf_by_type(
         interp::ASTTypeAnnotator, @nospecialize(func), arginfo::CC.ArgInfo,
         si::CC.StmtInfo, @nospecialize(atype), sv::CC.AbsIntState, max_methods::Int
@@ -521,6 +545,21 @@ function CC.abstract_call_gf_by_type(
     return @invoke CC.abstract_call_gf_by_type(
         interp::CC.AbstractInterpreter, func::Any, arginfo::CC.ArgInfo,
         si::CC.StmtInfo, atype::Any, sv::CC.AbsIntState, max_methods::Int)
+end
+else
+function CC.abstract_call_gf_by_type(
+        interp::ASTTypeAnnotator, @nospecialize(func), arginfo::CC.ArgInfo,
+        si::CC.StmtInfo, @nospecialize(atype), vtypes::Union{CC.VarTable,Nothing},
+        sv::CC.AbsIntState, max_methods::Int
+    )
+    if func === Base.Generator || func === Base.Iterators.Filter
+        record_iterator_argtype_observation!(interp, arginfo)
+    end
+    return @invoke CC.abstract_call_gf_by_type(
+        interp::CC.AbstractInterpreter, func::Any, arginfo::CC.ArgInfo,
+        si::CC.StmtInfo, atype::Any, vtypes::Union{CC.VarTable,Nothing},
+        sv::CC.AbsIntState, max_methods::Int)
+end
 end
 
 function record_iterator_argtype_observation!(
@@ -583,14 +622,19 @@ end
 # - If the same basic block has a slot assignment that dominates `idx`,
 #   use the assigned RHS's type (`ssavaluetypes[pc_assign]`).
 # - Otherwise fall back to the bb's entry varstate
-#   (`bb_vartables[bb][id]`), which CC's dataflow has already populated
+#   (`bb_states[bb].vartable[id]`), which CC's dataflow has already populated
 #   with cross-bb branch narrowing.
 function slot_type_at(slot::SlotNumber, idx::Int, frame::CC.InferenceState)
     pc_assign = CC.find_dominating_assignment(slot.id, idx, frame)
     pc_assign === nothing || return frame.ssavaluetypes[pc_assign]
     bb = CC.block_for_inst(frame.cfg, idx)
-    entry = @something frame.bb_vartables[bb] return frame.src.slottypes[slot.id]
-    return entry[slot.id].typ
+    @static if hasfield(CC.InferenceState, :bb_states)
+        entry = @something frame.bb_states[bb] return frame.src.slottypes[slot.id]
+        return entry.vartable[slot.id].typ
+    else
+        entry = @something frame.bb_vartables[bb] return frame.src.slottypes[slot.id]
+        return entry[slot.id].typ
+    end
 end
 
 # Extract the matched methods for a call site from CC's per-stmt `CallInfo`.
@@ -613,10 +657,12 @@ function collect_call_matches!(matches::Vector{Core.MethodMatch}, @nospecialize 
         for sub in info.split
             collect_call_matches!(matches, sub)
         end
-    elseif info isa CC.ConstCallInfo
-        # `ConstCallInfo` wraps the underlying dispatch info with a
-        # const-prop'd result; the same matching methods live one level down.
-        collect_call_matches!(matches, info.call)
+    else
+        @static if isdefined(CC, :ConstCallInfo)
+            if info isa CC.ConstCallInfo
+                collect_call_matches!(matches, info.call)
+            end
+        end
     end
     return matches
 end
@@ -767,8 +813,7 @@ function annotate_types!(
     end
 end
 
-function CC.finishinfer!(frame::CC.InferenceState, interp::ASTTypeAnnotator, cycleid::Int)
-    ret = @invoke CC.finishinfer!(frame::CC.InferenceState, interp::CC.AbstractInterpreter, cycleid::Int)
+function ast_finishinfer_post!(frame::CC.InferenceState, interp::ASTTypeAnnotator)
     if frame.linfo === interp.topmi
         annotate_types!(interp.toptree[1], frame, interp.filter)
     else
@@ -777,7 +822,22 @@ function CC.finishinfer!(frame::CC.InferenceState, interp::ASTTypeAnnotator, cyc
             record_oc_body_annotation_candidate!(interp, def, frame)
         end
     end
+    return nothing
+end
+@static if hasfield(CC.InferenceState, :world)
+function CC.finishinfer!(frame::CC.InferenceState, interp::ASTTypeAnnotator, cycleid::Int)
+    ret = @invoke CC.finishinfer!(frame::CC.InferenceState, interp::CC.AbstractInterpreter, cycleid::Int)
+    ast_finishinfer_post!(frame, interp)
     return ret
+end
+else
+function CC.finishinfer!(frame::CC.InferenceState, interp::ASTTypeAnnotator, cycleid::Int,
+                         opt_cache::IdDict{MethodInstance, Core.CodeInstance})
+    ret = @invoke CC.finishinfer!(frame::CC.InferenceState, interp::CC.AbstractInterpreter, cycleid::Int,
+                                  opt_cache::IdDict{MethodInstance, Core.CodeInstance})
+    ast_finishinfer_post!(frame, interp)
+    return ret
+end
 end
 
 # The pending `def` entry marks the dynamic extent of the eager `check=false`
@@ -933,7 +993,7 @@ function _infer_toplevel_tree(
         world::UInt = Base.get_world_counter()
     )
     filter = SyntheticFilter(st0, ctx3.bindings)
-    inf_cache = CC.InferenceResult[]
+    inf_cache = ASTLocalInferenceCache()
     interp = refinements = nothing
     for _ = 1:MAX_OC_REFINEMENT_PASSES
         observations = OCArgtypeTable()
@@ -1007,7 +1067,7 @@ function infer_lowered_tree(
         ctx3::JL.VariableAnalysisContext, inferrable_tree3::SyntaxTreeC,
         context_module::Module, world::UInt, filter::SyntheticFilter,
         observations::OCArgtypeTable, refinements::Union{Nothing,OCArgtypeTable},
-        inf_cache::Vector{CC.InferenceResult}
+        inf_cache::ASTLocalInferenceCache
     )
     inferrable_tree = try
         # Route single-method local closures through `OpaqueClosure` instead of
@@ -1049,7 +1109,7 @@ function infer_thunk!(
         tree::SyntaxTreeC, src::CodeInfo, context_module::Module,
         argtypes::Union{Nothing,Vector{Any}}, world::UInt, filter::SyntheticFilter,
         observations::OCArgtypeTable, refinements::Union{Nothing,OCArgtypeTable},
-        inf_cache::Vector{CC.InferenceResult}
+        inf_cache::ASTLocalInferenceCache
     )
     strip_latestworld!(src)
     mi = construct_toplevel_mi(src, context_module)
@@ -1111,7 +1171,7 @@ end
 function infer_method_defs!(
         inferred::SyntaxTreeC, src::CodeInfo, context_module::Module, world::UInt, filter::SyntheticFilter,
         observations::OCArgtypeTable, refinements::Union{Nothing,OCArgtypeTable},
-        inf_cache::Vector{CC.InferenceResult}
+        inf_cache::ASTLocalInferenceCache
     )
     block = inferred[1]
     nstmts = JS.numchildren(block)
